@@ -1,5 +1,6 @@
 from pathlib import Path
 from datetime import date
+import os
 
 import numpy as np
 import pandas as pd
@@ -118,12 +119,13 @@ st.set_page_config(
 
 BASE_DIR = Path(__file__).parent
 
-# --- Flexible path resolution: works whether files are in subfolders or root ---
+
 def _find_file(*candidates):
     for p in candidates:
         if p.exists():
             return p
-    return candidates[0]  # return first even if missing, for error messages
+    return candidates[0]
+
 
 DATA_DIR = BASE_DIR / "data" if (BASE_DIR / "data").exists() else BASE_DIR
 
@@ -154,7 +156,11 @@ EQUIPMENT_TYPES = ["Dry Van", "Reefer", "Flatbed", "Tanker", "Step Deck", "Power
 def load_model():
     if not MODEL_PATH.exists():
         return None
-    return joblib.load(MODEL_PATH)
+    try:
+        return joblib.load(MODEL_PATH)
+    except Exception as e:
+        st.session_state["_model_load_error"] = repr(e)
+        return None
 
 
 @st.cache_data(show_spinner=False)
@@ -200,9 +206,24 @@ page = st.sidebar.radio(
 )
 
 if model is None:
-    st.sidebar.error("Model not found. Check the file path.")
+    st.sidebar.error("Model not found. Check the debug panel below.")
+    with st.sidebar.expander("🔍 Debug info", expanded=True):
+        st.write("**BASE_DIR:**", str(BASE_DIR))
+        st.write("**BASE_DIR exists:**", BASE_DIR.exists())
+        try:
+            files = sorted(os.listdir(BASE_DIR))
+            st.write("**Files in repo root:**")
+            st.code("\n".join(files) if files else "(empty)")
+        except Exception as e:
+            st.write("Could not list:", repr(e))
+        st.write("**MODEL_PATH attempted:**", str(MODEL_PATH))
+        st.write("**MODEL_PATH exists:**", MODEL_PATH.exists())
+        err = st.session_state.get("_model_load_error")
+        if err:
+            st.write("**Load error:**")
+            st.code(err)
 else:
-    st.sidebar.success("Model loaded")
+    st.sidebar.success("Model loaded ✅")
     st.sidebar.caption(
         f"Slope: **{getattr(model, 'slope_', float('nan')):.3f}**  \n"
         f"Offset: **{getattr(model, 'offset_', float('nan')):.4f}**"
@@ -222,6 +243,12 @@ st.sidebar.markdown(
 if page == "Single Prediction":
     st.title("Single Load Rate Prediction")
     st.caption("Enter load details to estimate the posted freight rate.")
+
+    if model is None:
+        st.warning(
+            "The model file wasn't loaded. Open the **Debug info** panel "
+            "in the sidebar to see why."
+        )
 
     col1, col2 = st.columns(2)
     with col1:
@@ -254,7 +281,7 @@ if page == "Single Prediction":
 
     if st.button("Predict rate", type="primary"):
         if model is None:
-            st.error("Model not loaded.")
+            st.error("Model not loaded — see debug panel in the sidebar.")
         else:
             row = make_input_row(
                 pickup, delivery, p_lat, p_lon, d_lat, d_lon,
@@ -267,6 +294,207 @@ if page == "Single Prediction":
                 c1.metric("Predicted rate", f"${pred:,.2f}")
                 c2.metric("Rate per mile", f"${rpm:,.2f}")
                 c3.metric("Distance", f"{distance:,.0f} mi")
+
+                with st.expander("Input row sent to model"):
+                    st.dataframe(row, use_container_width=True)
+            except Exception as e:
+                st.exception(e)
+
+
+# =====================================================================
+# Page: Batch Upload
+# =====================================================================
+elif page == "Batch Upload":
+    st.title("Batch Prediction")
+    st.caption(
+        "Upload a CSV with columns: pickup, delivery, pickup_lat, pickup_lon, "
+        "delivery_lat, delivery_lon, distance, equipment, weight, date, market_index."
+    )
+
+    uploaded = st.file_uploader("Choose CSV file", type=["csv"])
+
+    if uploaded is not None:
+        df = pd.read_csv(uploaded)
+        st.write("Preview:", df.head())
+
+        required = ["pickup", "delivery", "pickup_lat", "pickup_lon",
+                    "delivery_lat", "delivery_lon", "distance",
+                    "equipment", "weight", "date", "market_index"]
+        missing = [c for c in required if c not in df.columns]
+
+        if missing:
+            st.error(f"Missing required columns: {missing}")
+        elif model is None:
+            st.error("Model not loaded — see debug panel in the sidebar.")
+        else:
+            with st.spinner("Predicting..."):
+                preds = model.predict(df[required])
+            out = df.copy()
+            out["predicted_rate"] = np.round(preds, 2)
+
+            st.success(f"Predicted {len(out):,} rows.")
+            st.dataframe(out.head(50), use_container_width=True)
+
+            st.download_button(
+                "Download predictions CSV",
+                data=out.to_csv(index=False).encode("utf-8"),
+                file_name="predictions.csv",
+                mime="text/csv",
+            )
+
+
+# =====================================================================
+# Page: December Chart
+# =====================================================================
+elif page == "December Chart":
+    st.title("December 2025 Predicted Load Rate")
+    st.caption("Forecasted daily freight rate for December 2025.")
+
+    if not DECEMBER_PATH.exists():
+        st.warning(
+            "Missing `december_chart_inputs_filled.csv`. "
+            "Place it in `data/` or at the repo root."
+        )
+    else:
+        dec = pd.read_csv(DECEMBER_PATH)
+        dec["date"] = pd.to_datetime(dec["date"])
+
+        fig, ax = plt.subplots(figsize=(10, 4))
+        ax.plot(dec["date"], dec["predicted_rate"], marker="o", linewidth=2)
+        ax.set_ylabel("rate ($)")
+        ax.set_xlabel("date")
+        ax.set_title("Candidate: December 2025 Predicted Load Rate")
+        ax.grid(True, alpha=0.3)
+        fig.autofmt_xdate()
+        st.pyplot(fig)
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Min rate", f"${dec['predicted_rate'].min():,.2f}")
+        c2.metric("Mean rate", f"${dec['predicted_rate'].mean():,.2f}")
+        c3.metric("Max rate", f"${dec['predicted_rate'].max():,.2f}")
+
+        with st.expander("View raw data"):
+            st.dataframe(dec, use_container_width=True)
+
+
+# =====================================================================
+# Page: About Me
+# =====================================================================
+elif page == "About Me":
+    st.title("About Me")
+    st.markdown("""
+    ### 👋 Hi, I'm Fransisca Iloh
+
+    I'm a **Data Scientist** passionate about turning messy, real-world data
+    into decisions people can actually act on. My work sits at the intersection
+    of **machine learning**, **product thinking**, and **clear communication** —
+    because a model only creates value when someone understands what it says.
+
+    ---
+
+    ### 🎯 What I focus on
+    - **Applied machine learning** — regression, forecasting, and end-to-end pipelines
+    - **Feature engineering** — building signal from raw, imperfect operational data
+    - **Model evaluation** — designing validation that reflects the real deployment setting
+    - **Deployment** — shipping models as usable tools, not just notebooks
+
+    ---
+
+    ### 🚚 About this project
+    This Streamlit app is the deployment layer for a freight rate prediction model.
+
+    **Problem:** Predict the `posted_rate` of a freight load from route, equipment,
+    distance, weight, and market conditions.
+
+    **Approach:** A two-stage regressor that combines
+    - a `HistGradientBoostingRegressor` for static lane / equipment / weight effects, and
+    - a time-aware market-index adjustment (14-day blocks + carried level) to model
+      slow rate drift through the year.
+
+    **Validation (time-based folds):**
+
+    | Metric | Value |
+    |---|---:|
+    | MAE | $57.09 |
+    | RMSE | $139.11 |
+    | R² | 0.989 |
+    | MAPE | 2.36 % |
+
+    **Design choice:** `quote_signal` was deliberately excluded to avoid leakage
+    and keep the model aligned with real, pre-quote prediction settings.
+
+    ---
+
+    ### 🛠️ Tools I work with
+    Python · pandas · NumPy · scikit-learn · Streamlit · matplotlib · Jupyter · Git
+
+    ---
+
+    ### 📬 Get in touch
+    - 📧 **Email:** your.email@example.com
+    - 💼 **LinkedIn:** [linkedin.com/in/your-handle](https://www.linkedin.com/)
+    - 🐙 **GitHub:** [github.com/IlohFransisca](https://github.com/IlohFransisca)
+
+    *Open to data science roles, freelance work, and collaborations on
+    real-world ML problems.*
+    """)
+
+
+# =====================================================================
+# Page: Feedback
+# =====================================================================
+else:
+    st.title("Feedback")
+    st.markdown(
+        "I'd love to hear what you think about this app. "
+        "Whether it's a bug, a feature idea, or just a quick comment — "
+        "every note helps me improve."
+    )
+
+    with st.form("feedback_form", clear_on_submit=True):
+        name = st.text_input("Your name (optional)", placeholder="Jane Doe")
+        email = st.text_input("Your email (optional)", placeholder="jane@example.com")
+        rating = st.slider("How would you rate this app?", 1, 5, 5)
+        category = st.selectbox(
+            "What's your feedback about?",
+            ["General comment", "Bug report", "Feature request", "Model accuracy", "UI / UX"],
+        )
+        message = st.text_area(
+            "Your feedback",
+            placeholder="Tell me what you think...",
+            height=150,
+        )
+        submitted = st.form_submit_button("Submit feedback", type="primary")
+
+        if submitted:
+            if not message.strip():
+                st.error("Please write a short message before submitting.")
+            else:
+                st.session_state.setdefault("feedback_log", []).append({
+                    "name": name or "Anonymous",
+                    "email": email,
+                    "rating": rating,
+                    "category": category,
+                    "message": message,
+                })
+                st.success(
+                    "Thank you for your feedback! 🙏 "
+                    "I read every message and it genuinely helps."
+                )
+                st.balloons()
+
+    st.markdown("---")
+    st.caption(
+        "Prefer email? Reach me at **your.email@example.com** — "
+        "I usually reply within a day."
+    )
+
+    with st.expander("Session feedback log (visible only to you)"):
+        log = st.session_state.get("feedback_log", [])
+        if log:
+            st.dataframe(pd.DataFrame(log), use_container_width=True)
+        else:
+            st.write("No feedback submitted in this session yet.")mi")
 
                 with st.expander("Input row sent to model"):
                     st.dataframe(row, use_container_width=True)
